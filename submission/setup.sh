@@ -4,86 +4,98 @@ set -e
 cd "$(dirname "$0")"
 
 # -----------------------------------------------------------------------------
-# Step 1: Ensure torch + CUDA are available.
-#   Fast path: platform has Blackwell-compatible torch pre-installed → keep it.
-#   Fallback : bootstrap torch 2.7.0 + cu128 family from pytorch.org (needs net).
-# Rationale: 4x RTX 5090 is Blackwell sm_120, needs CUDA 12.8 runtime.
-# PyPI's default torch==2.7.0 wheel is cu126 (no sm_120 kernels) — we must use
-# the pytorch.org cu128 index when bootstrapping.
+# Step 1: Verify torch + CUDA.
+# Evidence from the 2026-04-21 real-machine log: the platform has torch + CUDA
+# pre-installed at /usr/local/lib/python3.12/dist-packages (system-wide), and
+# vLLM imports fine there. The bootstrap branch below is only for a hypothetical
+# greenfield machine — the real competition platform never takes that path.
 # -----------------------------------------------------------------------------
-echo "[setup] Step 1: Ensuring torch + CUDA available..."
-if python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
-    python -c "
+echo "[setup] Step 1: Verifying torch + CUDA..."
+if python -c "
 import torch
-print(f'[setup] Platform torch detected: {torch.__version__}  cuda={torch.version.cuda}  '
+assert torch.cuda.is_available(), 'CUDA unavailable'
+print(f'[setup] torch {torch.__version__}  cuda {torch.version.cuda}  '
       f'devices={torch.cuda.device_count()}')
-"
+" 2>/dev/null; then
+    :
 else
-    echo "[setup] No working torch+CUDA on platform; bootstrapping torch 2.7.0 + cu128..."
+    echo "[setup] No working torch+CUDA found; bootstrapping torch 2.7.0 + cu128 family..."
     pip install --index-url https://download.pytorch.org/whl/cu128 \
         torch==2.7.0 torchaudio==2.7.0 torchvision==0.22.0 \
         || { echo "[setup] FATAL: torch cu128 bootstrap failed (no network?)"; exit 1; }
     python -c "
 import torch
 assert torch.cuda.is_available(), 'CUDA unavailable even after install'
-print(f'[setup] Bootstrapped torch {torch.__version__}  cuda={torch.version.cuda}  '
-      f'devices={torch.cuda.device_count()}')
+print(f'[setup] Bootstrapped torch {torch.__version__}  cuda {torch.version.cuda}')
 " || { echo "[setup] FATAL: torch installed but CUDA still unavailable"; exit 1; }
 fi
 
 # -----------------------------------------------------------------------------
-# Step 2: Install or verify vllm.
-#   - If platform already has vllm 0.9+ / 0.10+ / 0.11+, keep it (its deps are
-#     already there; reinstalling risks binary/ABI drift).
-#   - Otherwise install vllm==0.9.2.
-#       - If torch was platform-pre-installed (Step 1 fast path), use --no-deps
-#         to avoid any chance of pip pulling PyPI's cu126 torch over the
-#         Blackwell wheel. vLLM's other runtime deps are assumed already present
-#         (the platform shipped vLLM, so its deps shipped with it).
-#       - If we bootstrapped torch (Step 1 fallback path), do a full install so
-#         xformers / ray / transformers / etc. get pulled in. PEP 440 says
-#         `torch==2.7.0` matches `torch==2.7.0+cu128`, so the already-installed
-#         Blackwell torch satisfies vLLM's hard requirement without being
-#         replaced.
+# Step 2: Ensure a 0.9+ vllm is available (0.9+ is when --no-enable-log-requests
+# and --speculative-config JSON replaced the old flags we hit in the first upload).
+#
+# DO NOT downgrade to 0.9.2 if the platform already has a newer version — the
+# 2026-04-21 log shows the platform has vLLM 0.11.x-or-newer (evidenced by
+# flags like --moe-backend / --kv-offloading-backend / --gdn-prefill-backend
+# that don't exist before 0.11). Downgrading would break binary/dep integrity.
+#
+# Use a semver comparison in Python rather than a bash glob — a glob like
+# `0.9.*|0.10.*|0.11.*` silently misses 0.12.x / 1.x / pre-release dev tags.
 # -----------------------------------------------------------------------------
-echo "[setup] Step 2: Ensuring vllm installed..."
-CURRENT_VLLM=$(python -c "import vllm; print(vllm.__version__)" 2>/dev/null || echo "none")
-echo "[setup] Current vllm: $CURRENT_VLLM"
+echo "[setup] Step 2: Checking platform vllm..."
+VLLM_STATUS=$(python - <<'PY'
+try:
+    import vllm
+    v = vllm.__version__
+    parts = v.split('.')
+    major = int(parts[0])
+    minor = int(parts[1]) if len(parts) > 1 else 0
+    # 0.9+ or any 1.x+ has the new CLI flag syntax we need.
+    compat = (major > 0) or (major == 0 and minor >= 9)
+    print(f"{'compat' if compat else 'old'}|{v}")
+except ImportError:
+    print("missing|")
+except Exception as e:
+    print(f"error|{type(e).__name__}:{e}")
+PY
+)
+VLLM_STATE="${VLLM_STATUS%%|*}"
+VLLM_VER="${VLLM_STATUS#*|}"
+echo "[setup] vllm state=$VLLM_STATE  version=$VLLM_VER"
 
-# $BOOTSTRAPPED is "yes" if Step 1 took the fallback path.
-# We detect by checking whether transformers is also installed — if not, we're
-# on a greenfield environment and need vllm's full dep tree.
-HAS_VLLM_DEPS=$(python -c "import transformers, tokenizers; print('yes')" 2>/dev/null || echo "no")
-
-case "$CURRENT_VLLM" in
-    0.9.*|0.10.*|0.11.*)
-        echo "[setup] vllm $CURRENT_VLLM is compatible (0.9+ CLI syntax). Keeping it."
+case "$VLLM_STATE" in
+    compat)
+        echo "[setup] Keeping platform vllm $VLLM_VER (supports new CLI flags)."
         ;;
-    *)
-        if [ "$HAS_VLLM_DEPS" = "yes" ]; then
-            echo "[setup] Installing vllm==0.9.2 (--no-deps; platform has deps)..."
-            pip install --no-deps vllm==0.9.2
-        else
-            echo "[setup] Installing vllm==0.9.2 (full deps; greenfield env)..."
-            # Normal install — torch is already satisfied (local +cu128 tag matches
-            # ==2.7.0 per PEP 440), so pip will fetch xformers/ray/etc. without
-            # touching torch.
-            pip install vllm==0.9.2
-        fi
+    old)
+        echo "[setup] WARNING: platform vllm $VLLM_VER predates 0.9. Installing 0.9.2 --no-deps."
+        pip install --no-deps vllm==0.9.2
+        ;;
+    missing)
+        echo "[setup] No vllm found; installing 0.9.2 with deps (greenfield path)."
+        # PEP 440 local-version matching: installed torch X.Y.Z+cu128 satisfies
+        # vLLM's hard `torch==X.Y.Z` spec, so pip won't replace it.
+        pip install vllm==0.9.2
+        ;;
+    error)
+        echo "[setup] FATAL: vllm import raised $VLLM_VER"; exit 1
         ;;
 esac
 
 # -----------------------------------------------------------------------------
-# Step 3: Install our own extra — httpx (used by client.py + warmup.py).
-# Pure Python, safe to pin exactly.
+# Step 3: Ensure httpx (used by client.py + warmup.py).
+# Platform likely already has it (fastapi pulls it transitively); skip if so.
 # -----------------------------------------------------------------------------
-echo "[setup] Step 3: Installing httpx==0.27.2..."
-pip install httpx==0.27.2
+echo "[setup] Step 3: Ensuring httpx..."
+if python -c "import httpx" 2>/dev/null; then
+    python -c "import httpx; print(f'[setup] httpx {httpx.__version__} already present')"
+else
+    pip install httpx==0.27.2
+fi
 
 # -----------------------------------------------------------------------------
-# Step 4: Import sanity check — all critical packages load before run.sh starts
-# spinning up vLLM. Catches missing transitive deps early (cheaper to fail here
-# than after vLLM eats 30s of GPU memory).
+# Step 4: Import sanity check — all critical packages load before run.sh bothers
+# to spin up vLLM. Cheaper to fail here than after the server eats 30s of GPU mem.
 # -----------------------------------------------------------------------------
 echo "[setup] Step 4: Import sanity check..."
 python -c "
